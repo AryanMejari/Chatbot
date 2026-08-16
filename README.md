@@ -2,6 +2,8 @@
 
 A self-contained AI chatbot with:
 - **Text prompts** → Groq LLM (llama-3.3-70b-versatile), streamed token by token
+- **Rich answers** — the model replies in structured Markdown (headings, bold, tables, code,
+  callouts) and the UI renders it, including ```mermaid blocks as real diagrams
 - **Speech-to-text** → Groq Whisper, then feeds transcript into the LLM
 - **Simple HTML UI** — one file, no build step, opens directly in a browser
 
@@ -64,7 +66,7 @@ Go to **http://localhost:8100** in your browser.
     {"role": "assistant", "content": "..."}
   ],
   "temperature": 0.7,
-  "max_tokens": 1024
+  "max_tokens": 4096
 }
 ```
 
@@ -72,16 +74,19 @@ Go to **http://localhost:8100** in your browser.
 - `audio` — audio file (webm, wav, mp3, ogg, m4a)
 - `history` — JSON string of history array
 - `temperature` — float (default 0.7)
-- `max_tokens` — int (default 1024)
+- `max_tokens` — int (default 4096)
 
-Response is an SSE stream:
+Response is an SSE stream. Every event is a **single-line JSON object**, so Markdown newlines
+(blank lines, list items, code fences) survive the transport:
 ```
-data: [TRANSCRIPT] your spoken text\n\n
-data: first LLM token\n\n
-data: next token\n\n
+data: {"type": "transcript", "text": "your spoken text"}
+data: {"type": "token", "text": "## Heading\n\n"}
+data: {"type": "token", "text": "next chunk"}
 ...
-data: [DONE]\n\n
+data: {"type": "done"}
 ```
+Errors arrive as `data: {"type": "error", "message": "..."}`.
+`/chat` uses the same events, minus `transcript`.
 
 ---
 
@@ -104,6 +109,9 @@ chatbot/
 
 ## Notes
 - The UI stores conversation history in memory (browser tab). Refreshing clears it.
+- Mermaid is loaded from a CDN and diagrams render once a reply finishes streaming; without
+  network access the diagram falls back to its source code block.
+- Default `max_tokens` is 4096 so detailed, structured answers are not cut off.
 - Max recording time is 2 minutes (configurable in index.html).
 - The server keeps the last 20 turns of history in context to stay within token limits.
 - CORS is wide-open (`*`) — fine for local dev, restrict in production.

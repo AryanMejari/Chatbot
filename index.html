@@ -5,6 +5,24 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BlackSwan AI Chatbot</title>
+  <script type="module">
+    // Mermaid renders ```mermaid code blocks into real diagrams.
+    // Loaded as a module so the chat still works if the CDN is unreachable.
+    try {
+      const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs")).default;
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "dark",
+        fontFamily: "'Inter', system-ui, sans-serif",
+        flowchart: { curve: "basis", useMaxWidth: false },
+        sequence: { useMaxWidth: false },
+      });
+      window.mermaid = mermaid;
+    } catch (e) {
+      console.warn("Mermaid unavailable — diagrams will show as code:", e);
+    }
+  </script>
   <style>
     /* ── Reset ──────────────────────────────────────────────────── */
     *,
@@ -76,7 +94,7 @@
       display: flex;
       flex-direction: column;
       height: 100dvh;
-      max-width: 820px;
+      max-width: 960px;
       margin: 0 auto;
       padding: 0 16px;
     }
@@ -284,7 +302,7 @@
     }
 
     .bubble {
-      max-width: 72%;
+      max-width: 82%;
       padding: 12px 16px;
       border-radius: var(--radius);
       font-size: 0.92rem;
@@ -305,6 +323,60 @@
       border-bottom-right-radius: 4px;
       box-shadow: 0 4px 18px rgba(124, 58, 237, 0.35);
       white-space: pre-wrap;
+    }
+
+    /* ── Task list checkboxes ──────────────────────────────────── */
+    .bubble.ai .task-box {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 15px;
+      height: 15px;
+      margin-right: 8px;
+      border-radius: 4px;
+      border: 1px solid rgba(139, 92, 246, 0.5);
+      color: var(--accent);
+      font-size: 0.7rem;
+      line-height: 1;
+      vertical-align: -2px;
+    }
+
+    .bubble.ai .task-box.done {
+      background: rgba(139, 92, 246, 0.25);
+    }
+
+    /* ── Mermaid diagrams ──────────────────────────────────────── */
+    .bubble.ai .mermaid-block {
+      margin: 18px 0;
+      padding: 16px;
+      background: rgba(8, 8, 22, 0.72);
+      border: 1px solid rgba(139, 92, 246, 0.28);
+      border-radius: 12px;
+      overflow-x: auto;
+      text-align: center;
+    }
+
+    /* Render diagrams at full size and scroll horizontally rather than
+       shrinking them until the labels are unreadable. */
+    .bubble.ai .mermaid-block svg {
+      max-width: none !important;
+      height: auto;
+    }
+
+    .bubble.ai .mermaid-block .edgeLabel,
+    .bubble.ai .mermaid-block .edgeLabel p {
+      background: transparent !important;
+      color: #cfd2ef !important;
+    }
+
+    .bubble.ai .mermaid-block .edgeLabel rect {
+      opacity: 0 !important;
+    }
+
+    .bubble.ai .mermaid-error {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-bottom: 6px;
     }
 
     /* ── Markdown styles inside .bubble.ai ─────────────────────── */
@@ -346,14 +418,12 @@
     }
 
     .bubble.ai h3 {
-      font-size: 0.97rem;
+      font-size: 1rem;
       font-weight: 700;
       color: #c4b5fd;
       margin: 16px 0 6px;
       line-height: 1.35;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-size: 0.78rem;
+      letter-spacing: 0.01em;
     }
 
     .bubble.ai h4,
@@ -1188,6 +1258,8 @@
         // italic
         s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
         s = s.replace(/_([^_\n]+)_/g, "<em>$1</em>");
+        // strikethrough
+        s = s.replace(/~~(.+?)~~/g, "<del>$1</del>");
         // links  [text](url)
         s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
           (_, text, href) => `<a href="${esc(href)}" target="_blank" rel="noopener">${text}</a>`);
@@ -1213,18 +1285,27 @@
         const line = lines[i];
 
         // ── Fenced code block  ``` ─────────────────────────────
-        const fenceMatch = line.match(/^```(\w*)$/);
+        const fenceMatch = line.match(/^\s*```\s*([\w+#.-]*)\s*$/);
         if (fenceMatch) {
           flushPara();
           const lang = fenceMatch[1] || "";
           const codeLines = [];
           i++;
-          while (i < lines.length && !lines[i].startsWith("```")) {
-            codeLines.push(esc(lines[i]));
+          while (i < lines.length && !/^\s*```/.test(lines[i])) {
+            codeLines.push(lines[i]);
             i++;
           }
-          out.push(`<pre><code class="language-${esc(lang)}">${codeLines.join("\n")}</code></pre>`);
           i++; // skip closing ```
+          const code = codeLines.join("\n");
+          if (lang.toLowerCase() === "mermaid") {
+            // Rendered into an SVG once the stream finishes (see renderDiagrams)
+            out.push(
+              `<div class="mermaid-block" data-mermaid="${esc(code)}">` +
+              `<pre><code class="language-mermaid">${esc(code)}</code></pre></div>`
+            );
+          } else {
+            out.push(`<pre><code class="language-${esc(lang)}">${esc(code)}</code></pre>`);
+          }
           continue;
         }
 
@@ -1257,29 +1338,27 @@
           continue;
         }
 
-        // ── Unordered list  - * + ─────────────────────────────
-        if (/^[\s]*[-*+]\s+/.test(line)) {
+        // ── Lists (nested, ordered + unordered, task items) ────
+        if (LIST_ITEM_RE.test(line)) {
           flushPara();
-          const items = [];
-          while (i < lines.length && /^[\s]*[-*+]\s+/.test(lines[i])) {
-            const text = lines[i].replace(/^[\s]*[-*+]\s+/, "");
-            items.push(`<li>${inline(esc(text))}</li>`);
+          const block = [];
+          while (i < lines.length) {
+            const l = lines[i];
+            if (l.trim() === "") {
+              // A blank line only continues the list if another item follows
+              const next = lines[i + 1];
+              if (next === undefined || !LIST_ITEM_RE.test(next)) break;
+              i++;
+              continue;
+            }
+            const isItem = LIST_ITEM_RE.test(l);
+            // A non-item, indented line continues the previous item
+            const isContinuation = block.length > 0 && /^\s{2,}\S/.test(l);
+            if (!isItem && !isContinuation) break;
+            block.push(l);
             i++;
           }
-          out.push(`<ul>${items.join("")}</ul>`);
-          continue;
-        }
-
-        // ── Ordered list  1. 2. ───────────────────────────────
-        if (/^\d+\.\s+/.test(line)) {
-          flushPara();
-          const items = [];
-          while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
-            const text = lines[i].replace(/^\d+\.\s+/, "");
-            items.push(`<li>${inline(esc(text))}</li>`);
-            i++;
-          }
-          out.push(`<ol>${items.join("")}</ol>`);
+          out.push(renderList(block, inline, esc));
           continue;
         }
 
@@ -1318,6 +1397,96 @@
       return out.join("\n");
     }
 
+    // Matches `- item`, `* item`, `+ item`, `1. item`, `2) item` with any indent
+    const LIST_ITEM_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+
+    /* Build (possibly nested) <ul>/<ol> markup from a block of list lines. */
+    function renderList(src, inline, esc) {
+      let idx = 0;
+
+      function indentOf(line) {
+        return line.match(/^\s*/)[0].replace(/\t/g, "  ").length;
+      }
+
+      function parse(indent) {
+        const ordered = /\d/.test(src[idx].match(LIST_ITEM_RE)[2]);
+        const items = [];
+
+        while (idx < src.length) {
+          const m = src[idx].match(LIST_ITEM_RE);
+          if (!m) {
+            // wrapped continuation line — append to the current item
+            if (!items.length) break;
+            items[items.length - 1].text += " " + src[idx].trim();
+            idx++;
+            continue;
+          }
+          const ind = indentOf(src[idx]);
+          if (ind < indent) break;
+          if (ind > indent) {
+            if (!items.length) break;
+            items[items.length - 1].children.push(parse(ind));
+            continue;
+          }
+          const sameKind = /\d/.test(m[2]) === ordered;
+          if (!sameKind) break;
+          items.push({ text: m[3], children: [] });
+          idx++;
+        }
+
+        const tag = ordered ? "ol" : "ul";
+        const html = items.map(it => {
+          let text = it.text;
+          let prefix = "";
+          const task = text.match(/^\[([ xX])\]\s+(.*)$/);
+          if (task) {
+            prefix = `<span class="task-box${task[1] === " " ? "" : " done"}">${task[1] === " " ? "" : "✓"}</span>`;
+            text = task[2];
+          }
+          return `<li>${prefix}${inline(esc(text))}${it.children.join("")}</li>`;
+        }).join("");
+        return `<${tag}>${html}</${tag}>`;
+      }
+
+      let out = "";
+      while (idx < src.length) {
+        const before = idx;
+        out += parse(indentOf(src[idx]));
+        if (idx === before) break; // safety: never loop forever
+      }
+      return out;
+    }
+
+    /* Repair the mermaid syntax slips LLMs make most often. */
+    function sanitizeMermaid(src) {
+      return src
+        .replace(/(-{2,}>?\|[^|\n]*\|)>/g, "$1")   //  A -->|label|> B   →  A -->|label| B
+        .replace(/\u00a0/g, " ");                  //  non-breaking spaces
+    }
+
+    /* Turn every ```mermaid block inside `root` into an SVG diagram.
+       Called once a message has finished streaming, so half-written
+       diagrams are never handed to mermaid. */
+    let mermaidSeq = 0;
+    async function renderDiagrams(root) {
+      const blocks = root.querySelectorAll(".mermaid-block[data-mermaid]");
+      if (!blocks.length || !window.mermaid) return;
+
+      for (const block of blocks) {
+        const source = sanitizeMermaid(block.getAttribute("data-mermaid"));
+        try {
+          const { svg } = await window.mermaid.render(`mmd-${++mermaidSeq}`, source);
+          block.innerHTML = svg;
+          block.removeAttribute("data-mermaid");
+        } catch (err) {
+          console.warn("Mermaid render failed:", err);
+          block.removeAttribute("data-mermaid");
+          block.insertAdjacentHTML("afterbegin",
+            `<div class="mermaid-error">Diagram source (could not be rendered)</div>`);
+        }
+      }
+    }
+
     /* ─────────────────────────────────────────────────────────────────────────
        MESSAGE RENDERING
     ───────────────────────────────────────────────────────────────────────── */
@@ -1354,6 +1523,10 @@
           updateText(raw) {
             span.innerHTML = renderMarkdown(raw);
             scrollToBottom();
+          },
+          // Called once the stream is complete — renders mermaid diagrams
+          finalize() {
+            renderDiagrams(span).then(scrollToBottom);
           },
         };
       } else {
@@ -1410,10 +1583,21 @@
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
           const payload = line.slice(6);
-          if (payload === "[DONE]") return;
-          if (payload.startsWith("[ERROR]")) { showToast("⚠ " + payload.slice(8)); return; }
-          if (payload.startsWith("[TRANSCRIPT] ")) { onTranscript?.(payload.slice(13)); continue; }
-          onToken(payload);
+          if (!payload) continue;
+
+          // Events are JSON so Markdown newlines survive the SSE transport
+          let evt;
+          try {
+            evt = JSON.parse(payload);
+          } catch {
+            onToken(payload);   // tolerate a plain-text server
+            continue;
+          }
+
+          if (evt.type === "done") return;
+          if (evt.type === "error") { showToast("⚠ " + evt.message); return; }
+          if (evt.type === "transcript") { onTranscript?.(evt.text); continue; }
+          if (evt.type === "token") onToken(evt.text);
         }
       }
     }
@@ -1438,7 +1622,7 @@
         const res = await fetch(`${API_BASE}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, history: chatHistory, temperature: 0.7, max_tokens: 1024 }),
+          body: JSON.stringify({ message: text, history: chatHistory, temperature: 0.7, max_tokens: 4096 }),
         });
         if (!res.ok) {
           const e = await res.json().catch(() => ({ detail: "Unknown error" }));
@@ -1450,6 +1634,7 @@
           fullReply += token;
           msgCtrl.updateText(fullReply);
         });
+        msgCtrl.finalize();
       } catch (err) {
         removeThinking();
         showToast(err.message);
@@ -1631,7 +1816,7 @@
       formData.append("audio", file);
       formData.append("history", JSON.stringify(chatHistory));
       formData.append("temperature", "0.7");
-      formData.append("max_tokens", "1024");
+      formData.append("max_tokens", "4096");
 
       let transcript = "";
       let fullReply = "";
@@ -1667,6 +1852,7 @@
             }, 80);
           }
         );
+        msgCtrl?.finalize();
       } catch (err) {
         removeThinking();
         showToast(err.message);

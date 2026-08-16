@@ -16,6 +16,7 @@ Run:
 ─────────────────────────────────────────────────────────────────────────────
 """
 
+import json
 import os
 import logging
 from pathlib import Path
@@ -47,11 +48,46 @@ log = logging.getLogger("chatbot")
 groq = AsyncGroq(api_key=GROQ_API_KEY)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an intelligent, helpful, and concise AI assistant.
-You answer questions clearly and accurately.
-When asked about personal growth, career, habits, AI, or technology you give thoughtful, specific answers.
-Keep responses focused — avoid unnecessary padding.
-If you don't know something, say so honestly."""
+SYSTEM_PROMPT = """You are an intelligent, helpful AI assistant that answers in rich,
+well-structured GitHub-flavoured Markdown — never in one long wall of text.
+
+First decide how much structure the message needs:
+
+* **Simple exchange** — a greeting, small talk, a yes/no question, a one-fact lookup, or a
+  follow-up that needs a sentence: reply in one or two plain sentences. No heading, no
+  bullet list, no diagram. Never open with "## Introduction".
+* **Everything else** — explanations, comparisons, how-tos, code, planning, analysis: use the
+  full structure below.
+
+Formatting rules for structured answers:
+
+1. Start with a `##` heading that names the topic, then a one- or two-sentence summary.
+2. Break the answer into `##` sections and `###` sub-sections so the visual hierarchy shows
+   what is most important. Leave a blank line between every block (heading, paragraph, list,
+   table, code block) so the rendered output is airy and easy to scan.
+3. Use **bold** for key terms and takeaways, *italics* for nuance, and `inline code` for
+   identifiers, commands, file names and values.
+4. Prefer bullet lists and numbered steps over long paragraphs. Keep each bullet to one idea.
+   Indent sub-points by two spaces to nest them.
+5. Include concrete **examples**: fenced code blocks with a language tag
+   (```python, ```bash, ```json, ...) for anything runnable, and worked numeric examples
+   where they help.
+6. Use a Markdown table whenever you compare two or more things (options, pros/cons,
+   parameters, versions).
+7. Include a **diagram** whenever structure, flow, architecture or relationships matter.
+   Use a ```mermaid fenced block (flowchart, sequenceDiagram, classDiagram, pie, gantt,
+   mindmap, ER) — it is rendered as a real diagram in the UI. Keep mermaid node labels short
+   and plain (no quotes, brackets or punctuation inside a label), use valid edge syntax
+   (`A[Node] -->|label| B[Node]`), and prefer top-down flowcharts (`flowchart TD`) so the
+   diagram fits the chat width. A plain ASCII diagram inside a ```text block is a fine
+   fallback for simple sketches.
+8. Use `>` blockquotes for callouts ("> **Note:** ...", "> **Warning:** ...") and `---`
+   horizontal rules to separate major parts of a long answer.
+9. Finish longer answers with a short **Key takeaways** bullet list.
+10. Match depth to the question — a short question gets a short structured answer, not padding.
+
+Be accurate and specific, never pad with filler, and say so honestly when you don't know
+something."""
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -77,7 +113,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
     history: list[Message] = Field(default_factory=list)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=1024, ge=1, le=8000)
+    max_tokens: int = Field(default=4096, ge=1, le=8000)
 
 class TranscriptResponse(BaseModel):
     transcript: str
@@ -93,11 +129,20 @@ def build_messages(message: str, history: list[Message]) -> list[dict]:
     return msgs
 
 
+def sse(payload: dict) -> str:
+    """Serialise an event as a single-line JSON SSE frame.
+
+    Newlines are encoded inside the JSON string, so Markdown structure
+    (blank lines, list items, code fences) survives the transport.
+    """
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 async def stream_llm(
     message: str,
     history: list[Message],
     temperature: float = 0.7,
-    max_tokens: int = 1024,
+    max_tokens: int = 4096,
 ) -> AsyncGenerator[str, None]:
     """Yield SSE-formatted chunks from Groq streaming completion."""
     msgs = build_messages(message, history)
@@ -112,12 +157,11 @@ async def stream_llm(
         async for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                # SSE format: data: <payload>\n\n
-                yield f"data: {delta}\n\n"
-        yield "data: [DONE]\n\n"
+                yield sse({"type": "token", "text": delta})
+        yield sse({"type": "done"})
     except Exception as exc:
         log.error("LLM stream error: %s", exc)
-        yield f"data: [ERROR] {exc}\n\n"
+        yield sse({"type": "error", "message": str(exc)})
 
 
 async def transcribe_audio(file_bytes: bytes, filename: str, file_type: str) -> tuple[str, str | None]:
@@ -159,8 +203,8 @@ async def health():
 async def chat(req: ChatRequest):
     """
     Text prompt → streaming LLM response.
-    Returns an SSE stream. Each event is `data: <token>\n\n`.
-    Final event is `data: [DONE]\n\n`.
+    Returns an SSE stream. Each event is `data: {"type": "token", "text": "..."}`.
+    Final event is `data: {"type": "done"}`.
     """
     log.info("Chat  message=%r  history_len=%d", req.message[:80], len(req.history))
     return StreamingResponse(
@@ -203,20 +247,17 @@ async def speech_to_answer(
     audio: UploadFile = File(..., description="Audio file (webm, wav, mp3, ogg, m4a)"),
     history: str = Form(default="[]", description="JSON-encoded list of {role,content} messages"),
     temperature: float = Form(default=0.7),
-    max_tokens: int = Form(default=1024),
+    max_tokens: int = Form(default=4096),
 ):
     """
     Audio file → transcript + streaming LLM response.
 
     Returns a multipart-style SSE stream:
-      data: [TRANSCRIPT] <detected text>\n\n
-      data: <LLM token 1>\n\n
-      data: <LLM token 2>\n\n
+      data: {"type": "transcript", "text": "<detected text>"}
+      data: {"type": "token", "text": "<LLM token>"}
       ...
-      data: [DONE]\n\n
+      data: {"type": "done"}
     """
-    import json
-
     file_bytes = await audio.read()
     if len(file_bytes) < 100:
         raise HTTPException(400, "Audio file is empty or too short")
@@ -236,7 +277,7 @@ async def speech_to_answer(
 
     async def full_stream() -> AsyncGenerator[str, None]:
         # First event carries the transcript so the UI can display it
-        yield f"data: [TRANSCRIPT] {transcript}\n\n"
+        yield sse({"type": "transcript", "text": transcript})
         async for chunk in stream_llm(transcript, parsed_history, temperature, max_tokens):
             yield chunk
 
